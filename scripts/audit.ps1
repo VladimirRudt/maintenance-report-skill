@@ -102,5 +102,27 @@ $result = foreach ($group in $groupsMap.Values) {
     $output
 }
 
-# Output flat JSON array of affected package groups, sorted by package/prefix name
-$result | Sort-Object { if ($_.package) { $_.package } else { $_.prefix } } | ConvertTo-Json -Depth 10
+# Render as a markdown table, sorted by package/prefix name
+$sorted = $result | Sort-Object { if ($_.package) { $_.package } else { "$($_.prefix).*" } }
+
+function Format-VersionCell($version) {
+    if ($version -is [System.Collections.Generic.List[string]]) { return ($version -join ', ') }
+    return $version
+}
+
+$lines = @()
+$lines += '| Package | Current Version | Latest Version | Vulnerable | Projects |'
+$lines += '| :--- | :--- | :--- | :--- | :--- |'
+foreach ($row in $sorted) {
+    $name = if ($row.package) { $row.package } else { "$($row.prefix).* ($($row.includedPackages -join ', '))" }
+    $current = Format-VersionCell $row.currentVersion
+    $vulnerable = if ($row.isVulnerable) { 'Yes' } else { 'No' }
+    $projects = $row.projects -join ', '
+    $lines += "| $name | $current | $($row.latestVersion) | $vulnerable | $projects |"
+}
+
+if ($sorted.Count -eq 0) {
+    "All packages are up to date and no vulnerabilities were found."
+} else {
+    $lines -join "`n"
+}
