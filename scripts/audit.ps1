@@ -1,0 +1,106 @@
+param(
+    [Parameter(Position=0)]
+    [string]$Path
+)
+
+# Execute CLI commands with target path and JSON formatting
+$outdatedJson = dotnet list $Path package --outdated --include-transitive --format json | ConvertFrom-Json
+$vulnerableJson = dotnet list $Path package --vulnerable --include-transitive --format json | ConvertFrom-Json
+
+$packagesMap = @{}
+
+function Merge-PackageData($data, [bool]$isVulnerable) {
+    if (-not $data.projects) { return }
+    foreach ($project in $data.projects) {
+        foreach ($fw in $project.frameworks) {
+            $allPkgs = @()
+            if ($fw.topLevelPackages) { $allPkgs += $fw.topLevelPackages }
+            if ($fw.transitivePackages) { $allPkgs += $fw.transitivePackages }
+
+            foreach ($pkg in $allPkgs) {
+                $key = $pkg.id
+                if (-not $packagesMap.ContainsKey($key)) {
+                    $packagesMap[$key] = [ordered]@{
+                        package        = $pkg.id
+                        currentVersion = $pkg.resolvedVersion
+                        latestVersion  = $pkg.latestVersion
+                        isVulnerable   = $isVulnerable
+                        projects       = [System.Collections.Generic.List[string]]::new()
+                    }
+                }
+
+                $entry = $packagesMap[$key]
+                if ($pkg.latestVersion) { $entry.latestVersion = $pkg.latestVersion }
+                if ($isVulnerable) { $entry.isVulnerable = $true }
+                if (-not $entry.projects.Contains($project.path)) {
+                    $entry.projects.Add($project.path)
+                }
+            }
+        }
+    }
+}
+
+Merge-PackageData -data $outdatedJson -isVulnerable $false
+Merge-PackageData -data $vulnerableJson -isVulnerable $true
+
+# Packages sharing the same latest version and a common name prefix are usually updated together
+function Get-PackageNamespace([string]$packageId) {
+    return ($packageId -split '\.')[0]
+}
+
+function Get-CommonPrefix([string[]]$packageIds) {
+    $segmentLists = @($packageIds | ForEach-Object { , ($_ -split '\.') })
+    $minSegments = ($segmentLists | ForEach-Object { $_.Count } | Measure-Object -Minimum).Minimum
+    $commonSegments = @()
+    for ($i = 0; $i -lt $minSegments; $i++) {
+        $segment = $segmentLists[0][$i]
+        if (($segmentLists | Where-Object { $_[$i] -ne $segment }).Count -gt 0) { break }
+        $commonSegments += $segment
+    }
+    return $commonSegments -join '.'
+}
+
+$groupsMap = [ordered]@{}
+foreach ($entry in $packagesMap.Values) {
+    $namespace = Get-PackageNamespace $entry.package
+    $groupKey = "$($entry.latestVersion)|$namespace"
+    if (-not $groupsMap.Contains($groupKey)) {
+        $groupsMap[$groupKey] = [ordered]@{
+            currentVersion = [System.Collections.Generic.List[string]]::new()
+            latestVersion  = $entry.latestVersion
+            isVulnerable   = $false
+            projects       = [System.Collections.Generic.List[string]]::new()
+            packages       = [System.Collections.Generic.List[string]]::new()
+        }
+    }
+
+    $group = $groupsMap[$groupKey]
+    if (-not $group.currentVersion.Contains($entry.currentVersion)) { $group.currentVersion.Add($entry.currentVersion) }
+    if ($entry.isVulnerable) { $group.isVulnerable = $true }
+    $group.packages.Add($entry.package)
+    foreach ($project in $entry.projects) {
+        if (-not $group.projects.Contains($project)) { $group.projects.Add($project) }
+    }
+}
+
+# Collapse single-value version lists and single-package groups for readability
+$result = foreach ($group in $groupsMap.Values) {
+    if ($group.currentVersion.Count -eq 1) { $group.currentVersion = $group.currentVersion[0] }
+
+    $output = [ordered]@{
+        currentVersion = $group.currentVersion
+        latestVersion  = $group.latestVersion
+        isVulnerable   = $group.isVulnerable
+        projects       = $group.projects
+    }
+    if ($group.packages.Count -eq 1) {
+        $output.package = $group.packages[0]
+    } else {
+        $output.prefix = Get-CommonPrefix $group.packages
+        $output.includedPackages = $group.packages
+    }
+    $output
+}
+
+# Output flat JSON array of affected package groups, sorted by package/prefix name
+$result | Sort-Object { if ($_.package) { $_.package } else { $_.prefix } } | ConvertTo-Json -Depth 10
