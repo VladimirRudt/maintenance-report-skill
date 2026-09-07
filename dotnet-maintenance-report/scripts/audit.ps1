@@ -1,6 +1,9 @@
 param(
     [Parameter(Position=0)]
-    [string]$Path
+    [string]$Path,
+
+    [Parameter(Position=1)]
+    [string]$OutputPath
 )
 
 # Execute CLI commands with target path and JSON formatting
@@ -32,8 +35,10 @@ function Merge-PackageData($data, [bool]$isVulnerable) {
                 $entry = $packagesMap[$key]
                 if ($pkg.latestVersion) { $entry.latestVersion = $pkg.latestVersion }
                 if ($isVulnerable) { $entry.isVulnerable = $true }
-                if (-not $entry.projects.Contains($project.path)) {
-                    $entry.projects.Add($project.path)
+                # Use the project file name only, not its full/nested path
+                $projectName = Split-Path -Leaf $project.path
+                if (-not $entry.projects.Contains($projectName)) {
+                    $entry.projects.Add($projectName)
                 }
             }
         }
@@ -110,19 +115,39 @@ function Format-VersionCell($version) {
     return $version
 }
 
-$lines = @()
-$lines += '| Package | Current Version | Latest Version | Vulnerable | Projects |'
-$lines += '| :--- | :--- | :--- | :--- | :--- |'
-foreach ($row in $sorted) {
-    $name = if ($row.package) { $row.package } else { "$($row.prefix).* ($($row.includedPackages -join ', '))" }
-    $current = Format-VersionCell $row.currentVersion
-    $vulnerable = if ($row.isVulnerable) { 'Yes' } else { 'No' }
-    $projects = $row.projects -join ', '
-    $lines += "| $name | $current | $($row.latestVersion) | $vulnerable | $projects |"
+function Build-Table($rows) {
+    $tableLines = @()
+    $tableLines += '| Package | Current Version | Latest Version | Vulnerable | Projects |'
+    $tableLines += '| :--- | :--- | :--- | :--- | :--- |'
+    foreach ($row in $rows) {
+        $name = if ($row.package) { $row.package } else { "$($row.prefix).* ($($row.includedPackages -join ', '))" }
+        $current = Format-VersionCell $row.currentVersion
+        $vulnerable = if ($row.isVulnerable) { 'Yes' } else { 'No' }
+        $projects = $row.projects -join ', '
+        $tableLines += "| $name | $current | $($row.latestVersion) | $vulnerable | $projects |"
+    }
+    return $tableLines -join "`n"
 }
 
-if ($sorted.Count -eq 0) {
+# Resolve default output path next to the target (file or directory)
+if (-not $OutputPath) {
+    $resolvedTarget = Resolve-Path $Path -ErrorAction SilentlyContinue
+    if ($resolvedTarget -and (Test-Path $resolvedTarget -PathType Leaf)) {
+        $reportDir = Split-Path -Parent $resolvedTarget
+    } elseif ($resolvedTarget) {
+        $reportDir = $resolvedTarget
+    } else {
+        $reportDir = Get-Location
+    }
+    $OutputPath = Join-Path $reportDir 'audit-report.md'
+}
+
+$fullTable = if ($sorted.Count -eq 0) {
     "All packages are up to date and no vulnerabilities were found."
 } else {
-    $lines -join "`n"
+    Build-Table $sorted
 }
+"# Dependency Audit Report`n`n$fullTable" | Set-Content -Path $OutputPath -Encoding utf8
+
+# Return all packages; the full list is also saved to $OutputPath for later reference
+$fullTable
