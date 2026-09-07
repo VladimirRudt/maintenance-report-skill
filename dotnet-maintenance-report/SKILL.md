@@ -28,13 +28,19 @@ Wraps `dotnet list package --outdated`/`--vulnerable`, returns the full markdown
 ### Step 2: Discover Manifests & Project Type
 Find `.csproj` files, `Directory.Packages.props` (CPM), `Directory.Build.props`, lock files. Note whether `target_repo` looks like a web or desktop project (SDK/UI framework references) — useful context if Step 4 runs later.
 
+Also determine, per project, whether it's **SDK-style** (`<Project Sdk="...">` + `<PackageReference>`) or **classic/non-SDK-style** (old `<Project ToolsVersion=...>` header + a `packages.config` file for NuGet packages). This matters for Step 1/5: `dotnet list package` only works on SDK-style projects, so `audit.ps1` audits `packages.config` projects separately via the NuGet/OSV APIs (lower-fidelity: no transitive package resolution, and vulnerability data comes from OSV.dev rather than the NuGet audit feed — flag results from this path as such). Also note each project's TFM: `net48`/`net472`/etc. (.NET Framework) vs `net8.0`+ (.NET/.NET Core) — this decides which currency source Step 3 uses.
+
 ### Step 3: Verify Manifests & Framework/SDK Currency
 Read manifests to confirm target framework(s) and whether versions are centrally managed vs. scattered (a smell). If `audit.ps1` can't run, inventory versions manually and mark uncertain ones "verify on nuget.org" — never invent a version.
 
-Also check:
+For **.NET / .NET Core** TFMs (`netX.0`), check:
 * TFM vs. latest .NET release. Determine the current latest/LTS releases and support status from the official [`releases-index.json`](https://dotnetcli.blob.core.windows.net/dotnet/release-metadata/releases-index.json) (fetch it rather than relying on local `dotnet` tooling or guessing) — it lists each channel's `latest-release`, `latest-release-date`, `support-phase` (active/lts/eol/preview), and `eol-date`.
 * `dotnet --list-sdks` / `global.json` pin, compared against the SDK version for the matching channel in `releases-index.json`.
 * Support status (Current/LTS/out-of-support) per the `support-phase`/`eol-date` fields above.
+
+For **.NET Framework** TFMs (`net48`, `net472`, etc.), the releases-index/global.json model doesn't apply — there's no side-by-side SDK. Instead:
+* Compare the TFM against the latest released .NET Framework version (4.8.1 as of the last release) and note whether it's the version installed via Windows Update/OS component rather than a project-level SDK.
+* Determine support status from the official Microsoft Lifecycle policy page for .NET Framework (fetch it rather than guessing) — support is tied to the underlying Windows OS lifecycle, not an independent EOL date.
 Report this as its own finding even if all packages are current.
 
 ### Step 4 (optional, only if user opts in): Compare Architecture vs. Boilerplate
@@ -59,6 +65,12 @@ No time estimates — Low/Medium/High only.
 
 ### Step 6 (optional, only if user opts in): Deep Breaking-Changes Investigation
 Run only if the user chose to include it. Goes beyond Step 5's reasoning by pulling the actual official breaking-change docs and checking each one against real usage in `target_repo`.
+
+If `target_repo` is pure **.NET Framework** (no `netX.0` projects), the `dotnet/docs` "breaking-changes.md" pages mostly cover .NET Core/5+ and don't apply — 4.x releases are largely additive/backward-compatible within the 4.x line. Run:
+```powershell
+./scripts/breaking-changes.ps1 -Framework
+```
+This returns the dotnet/docs migration-guide pages instead (retargeting changes, app-compat, runtime/SDK versioning) — treat these the same way as the default index pages in the steps below. If the repo mixes Framework and Core/5+ projects, run the script both with and without `-Framework` and scope each set of results to the projects that actually target that runtime family.
 
 1. Run the discovery script to get the current list of breaking-changes index docs:
    ```powershell

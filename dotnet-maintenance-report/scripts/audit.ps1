@@ -7,10 +7,71 @@ param(
 )
 
 # Execute CLI commands with target path and JSON formatting
-$outdatedJson = dotnet list $Path package --outdated --include-transitive --format json | ConvertFrom-Json
-$vulnerableJson = dotnet list $Path package --vulnerable --include-transitive --format json | ConvertFrom-Json
+# `dotnet list package` only understands SDK-style projects; legacy packages.config
+# projects are audited separately below via the NuGet/OSV APIs.
+$outdatedJson = $null
+$vulnerableJson = $null
+try {
+    $outdatedJson = dotnet list $Path package --outdated --include-transitive --format json 2>$null | ConvertFrom-Json
+} catch {}
+try {
+    $vulnerableJson = dotnet list $Path package --vulnerable --include-transitive --format json 2>$null | ConvertFrom-Json
+} catch {}
 
 $packagesMap = @{}
+
+# --- Legacy packages.config support (classic .NET Framework projects) ---
+function Get-LatestNuGetVersion([string]$packageId) {
+    try {
+        $uri = "https://api.nuget.org/v3-flatcontainer/$($packageId.ToLower())/index.json"
+        $versions = (Invoke-RestMethod -Uri $uri -Method Get -ErrorAction Stop).versions
+        $stable = $versions | Where-Object { $_ -notmatch '-' }
+        if ($stable) { return ($stable | Select-Object -Last 1) }
+        return ($versions | Select-Object -Last 1)
+    } catch {
+        return $null
+    }
+}
+
+function Test-NuGetVulnerable([string]$packageId, [string]$version) {
+    try {
+        $body = @{ package = @{ name = $packageId; ecosystem = 'NuGet' }; version = $version } | ConvertTo-Json
+        $response = Invoke-RestMethod -Uri 'https://api.osv.dev/v1/query' -Method Post -Body $body -ContentType 'application/json' -ErrorAction Stop
+        return [bool]($response.vulns -and $response.vulns.Count -gt 0)
+    } catch {
+        return $false
+    }
+}
+
+function Merge-LegacyPackageData([string]$searchPath) {
+    $configs = Get-ChildItem -Path $searchPath -Filter 'packages.config' -Recurse -ErrorAction SilentlyContinue
+    foreach ($config in $configs) {
+        [xml]$xml = Get-Content $config.FullName
+        $projectName = Split-Path -Leaf (Get-ChildItem -Path $config.Directory -Filter '*.csproj' -ErrorAction SilentlyContinue | Select-Object -First 1).FullName
+        if (-not $projectName) { $projectName = $config.Directory.Name }
+        foreach ($pkg in $xml.packages.package) {
+            $key = $pkg.id
+            $latest = Get-LatestNuGetVersion $pkg.id
+            $isVulnerable = Test-NuGetVulnerable $pkg.id $pkg.version
+
+            if (-not $packagesMap.ContainsKey($key)) {
+                $packagesMap[$key] = [ordered]@{
+                    package        = $pkg.id
+                    currentVersion = $pkg.version
+                    latestVersion  = $latest
+                    isVulnerable   = $isVulnerable
+                    projects       = [System.Collections.Generic.List[string]]::new()
+                }
+            }
+            $entry = $packagesMap[$key]
+            if ($latest) { $entry.latestVersion = $latest }
+            if ($isVulnerable) { $entry.isVulnerable = $true }
+            if (-not $entry.projects.Contains($projectName)) {
+                $entry.projects.Add($projectName)
+            }
+        }
+    }
+}
 
 function Merge-PackageData($data, [bool]$isVulnerable) {
     if (-not $data.projects) { return }
@@ -45,8 +106,9 @@ function Merge-PackageData($data, [bool]$isVulnerable) {
     }
 }
 
-Merge-PackageData -data $outdatedJson -isVulnerable $false
-Merge-PackageData -data $vulnerableJson -isVulnerable $true
+if ($outdatedJson) { Merge-PackageData -data $outdatedJson -isVulnerable $false }
+if ($vulnerableJson) { Merge-PackageData -data $vulnerableJson -isVulnerable $true }
+Merge-LegacyPackageData -searchPath $Path
 
 # Packages sharing the same latest version and a common name prefix are usually updated together
 function Get-PackageNamespace([string]$packageId) {
